@@ -166,8 +166,7 @@ def load_state(results_dir):
     return {
         "completed": [],
         "queue": [],
-        "current": None,
-        "visited_urls": []
+        "current": None
     }
 
 
@@ -178,7 +177,7 @@ def save_state(state, results_dir):
 
 
 def save_finding(finding, domain_dir):
-    """Append finding to domain findings.json immediately."""
+    """Append finding to domain findings.json immediately — deduped by URL."""
     findings_file = os.path.join(domain_dir, "findings.json")
     existing = []
     if os.path.exists(findings_file):
@@ -187,6 +186,9 @@ def save_finding(finding, domain_dir):
                 existing = json.load(f)
         except Exception:
             pass
+    existing_urls = {f.get("url") for f in existing}
+    if finding.get("url") in existing_urls:
+        return  # already saved
     existing.append(finding)
     with open(findings_file, 'w') as f:
         json.dump(existing, f, indent=2)
@@ -337,7 +339,13 @@ def generate_param_wordlist(url, endpoint, tech, status, resp_headers, ai):
                          headers=json.dumps(resp_headers))
     out = ask_ai(prompt, ai=ai)
     data = extract_json(out)
+    try:
+        validate_ai_json(data, ["param_list"])
+    except ValueError:
+        data["param_list"] = []
     params = data.get("param_list", [])
+    if not isinstance(params, list):
+        params = []
     if not params:
         # fallback to burp list
         return f"{WORDLISTS_DIR}/parameters/burp-parameter-names.txt", data, False
@@ -363,27 +371,28 @@ def judge_finding(finding, status, size, response_snippet, tech, domain, ai):
 # ─────────────────────────────────────────
 #  DOMAIN FUZZER
 # ─────────────────────────────────────────
-def fuzz_url(target_url, ai, domain_dir, state, depth=0, tech=None, filter_flags=None, threads=None):
+def fuzz_url(target_url, ai, domain_dir, state, depth=0, tech=None, filter_flags=None, threads=None, _visited=None):
     """
     Recursive fuzzer for a single URL level.
     Returns list of findings.
+    _visited: in-memory set for recursion dedup — never persisted to state.
     """
     if depth > MAX_DEPTH:
         return []
+
+    if _visited is None:
+        _visited = set()
 
     findings = []
     parsed   = urlparse(target_url)
     base_url = f"{parsed.scheme}://{parsed.netloc}"
     fuzz_target = target_url.rstrip('/') + "/FUZZ"
 
-    # Skip already visited
-    visited = state.get("visited_urls", [])
-    if fuzz_target in visited:
+    # Skip already visited within this domain run (prevents recursion loops)
+    if fuzz_target in _visited:
         print(f"{'  '*depth}[~] Already visited: {fuzz_target} — skip")
         return []
-    visited.append(fuzz_target)
-    state["visited_urls"] = visited
-    save_state(state, domain_dir + "/..")   # state lives one level up
+    _visited.add(fuzz_target)
 
     indent = "  " * depth
     print(f"\n{indent}[+] Fuzzing depth {depth}: {target_url}")
@@ -521,7 +530,8 @@ def fuzz_url(target_url, ai, domain_dir, state, depth=0, tech=None, filter_flags
                 sub_url = base_url + "/" + path.lstrip("/").rstrip("/")
                 sub_findings = fuzz_url(
                     sub_url, ai, domain_dir, state,
-                    depth=depth + 1, tech=tech, filter_flags=filter_flags, threads=threads
+                    depth=depth + 1, tech=tech, filter_flags=filter_flags, threads=threads,
+                    _visited=_visited
                 )
                 findings.extend(sub_findings)
 
