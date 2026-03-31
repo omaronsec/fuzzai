@@ -528,6 +528,8 @@ def fuzz_url(target_url, ai, domain_dir, state, depth=0, tech=None,
         try:
             tech = tech_detect(target_url, ai)
             log(f"{indent}[*] Tech: {tech.get('technologies')} → {tech.get('primary_wordlist')}")
+        except BudgetExhausted:
+            raise
         except Exception as e:
             log(f"{indent}[!] Tech detect failed ({e}) — using default wordlist")
             tech = {"primary_wordlist": f"{WORDLISTS_DIR}/general/onelistforallmicro.txt"}
@@ -565,6 +567,8 @@ def fuzz_url(target_url, ai, domain_dir, state, depth=0, tech=None,
                 log(f"{indent}[*] Filters: {fdata.get('filter_command', 'none')}")
                 if fdata.get("real_findings"):
                     log(f"{indent}[*] Spotted in sample: {fdata['real_findings']}")
+            except BudgetExhausted:
+                raise
             except Exception as e:
                 log(f"{indent}[!] Filter analysis failed ({e}) — continuing without filter")
 
@@ -650,6 +654,8 @@ def fuzz_url(target_url, ai, domain_dir, state, depth=0, tech=None,
                     try:
                         judgment = judge_finding(path, status, size, snippet, tech,
                                                  parsed.netloc, ai)
+                    except BudgetExhausted:
+                        raise
                     except Exception as e:
                         log(f"{indent}  [!] Judge failed ({e}) — skipping")
                         continue
@@ -754,6 +760,8 @@ def fuzz_url(target_url, ai, domain_dir, state, depth=0, tech=None,
                                 findings.append(pfinding)
                                 save_finding(pfinding, domain_dir)
                                 log(f"{indent}  [!!!] PARAM [{pfinding['severity'].upper()}]: {pfinding['title']}")
+                        except BudgetExhausted:
+                            raise
                         except Exception as e:
                             log(f"{indent}  [!] Param judge failed ({e})")
 
@@ -761,6 +769,8 @@ def fuzz_url(target_url, ai, domain_dir, state, depth=0, tech=None,
                     if is_temp and os.path.exists(param_file):
                         os.unlink(param_file)
 
+        except BudgetExhausted:
+            raise
         except Exception as e:
             log(f"{indent}  [!] Error on {path}: {e}")
             continue
