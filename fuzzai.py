@@ -259,8 +259,11 @@ def run_ffuf_sampled(url, wordlist, sample_ratio=0.20, extra_flags=None, threads
             count += 1
     tmp.close()
 
-    lines, errors, stderr = run_ffuf(url, tmp.name, extra_flags=extra_flags, threads=threads)
-    os.unlink(tmp.name)
+    try:
+        lines, errors, stderr = run_ffuf(url, tmp.name, extra_flags=extra_flags, threads=threads)
+    finally:
+        if os.path.exists(tmp.name):
+            os.unlink(tmp.name)
     return lines, errors, total, stderr
 
 
@@ -573,11 +576,15 @@ def fuzz_url(target_url, ai, domain_dir, state, depth=0, tech=None, filter_flags
                             except ValueError:
                                 pass
 
+                    seen_params = set()
                     for pline, test_val in tagged:
                         pd = parse_ffuf_line(pline)
                         if not pd:
                             continue
                         param_name = pd["path"]
+                        if param_name in seen_params:
+                            continue
+                        seen_params.add(param_name)
                         param_path = f"{path}?{param_name}={test_val}"
 
                         # Only save if response is meaningfully different (not same size as baseline)
