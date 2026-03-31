@@ -40,6 +40,11 @@ NOT WORTH REPORTING:
 - Redirects to login pages
 - 403 on admin paths (protected, not accessible)
 - Standard CMS files that are expected to be public
+- Response snippet is an HTML error page (404/403/500 page) — server returned wrong status, file does not actually exist
+- Response snippet contains "Not Found", "404", "Page not found", "doesn't exist" — false positive, skip it
+- Response snippet is a redirect page or login form — not the actual file
+
+CRITICAL RULE: If the response_snippet looks like an HTML error page or "not found" message, set worth_reporting to false regardless of the path name. The file does not exist even if status showed 200.
 
 RESPOND ONLY WITH VALID JSON. NO PREAMBLE. NO EXPLANATION.
 
@@ -113,6 +118,28 @@ Output:
   "impact": "Internal log access reveals user emails, internal IPs, SQL queries, and application internals",
   "steps": ["GET /admin/download?file=/var/log/app.log", "Response contains internal log data", "Escalate: try ?file=/etc/passwd, ?file=../../../wp-config.php"],
   "notes": "Test for full LFI escalation — this is likely a path traversal entry point"
+}
+
+---
+
+---
+
+Input:
+Path: /pipeline.yml
+Status: 200
+Size: 6296
+Response snippet: <!DOCTYPE HTML PUBLIC "-//IETF//DTD HTML 2.0//EN"><html><head><title>404 Not Found</title></head><body><h1>Not Found</h1><p>The requested URL /pipeline.yml was not found on this server.</p></body></html>
+
+Output:
+{
+  "finding": "/pipeline.yml",
+  "severity": "info",
+  "worth_reporting": false,
+  "title": "False Positive — HTML error page returned as 200",
+  "description": "Server returned a 200 status but the response body is a 404 HTML error page. The file does not exist.",
+  "impact": "None — file not present",
+  "steps": [],
+  "notes": "Custom 404 page served with 200 status — common misconfiguration, not a real finding"
 }
 
 ---

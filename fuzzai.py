@@ -10,6 +10,7 @@ import tempfile
 import requests
 import re
 from urllib.parse import urlparse
+from collections import Counter
 from bs4 import BeautifulSoup
 from datetime import datetime
 
@@ -489,6 +490,25 @@ def judge_finding(finding, status, size, response_snippet, tech, domain, ai):
     return data
 
 
+def _merge_filter_flags(base, ai):
+    """Merge two ffuf flag lists, combining -fs values into one comma-separated list."""
+    combined = {}
+    for flags in [base, ai]:
+        i = 0
+        while i < len(flags):
+            if flags[i] in {"-fs", "-fw", "-fl", "-fc"} and i + 1 < len(flags):
+                key = flags[i]
+                vals = set(flags[i+1].split(','))
+                combined.setdefault(key, set()).update(vals)
+                i += 2
+            else:
+                i += 1
+    result = []
+    for flag, vals in combined.items():
+        result += [flag, ",".join(sorted(vals))]
+    return result
+
+
 # ─────────────────────────────────────────
 #  DOMAIN FUZZER
 # ─────────────────────────────────────────
@@ -558,19 +578,43 @@ def fuzz_url(target_url, ai, domain_dir, state, depth=0, tech=None,
 
     log(f"{indent}[*] Sample: {len(sample_results)} hits from ~{int(total*SAMPLE_RATIO)} reqs")
 
-    # ── Filter analysis
+    # ── Deterministic pre-filters (always applied, no AI needed)
+    # 302 with size 0 = redirect to nowhere, pure noise — always filter
+    # 302 with size 0 is the most common false positive pattern
+    base_filters = []
+    sizes_in_sample = [r["size"] for r in sample_results]
+    if sizes_in_sample:
+                size_counts = Counter(sizes_in_sample)
+        # Any size appearing on >30% of results is a catch-all — filter it
+        threshold = max(5, int(len(sample_results) * 0.30))
+        noisy_sizes = [str(s) for s, c in size_counts.items() if c >= threshold and s != 0]
+        if noisy_sizes:
+            base_filters += ["-fs", ",".join(noisy_sizes)]
+            log(f"{indent}[*] Auto-filter noisy sizes: {','.join(noisy_sizes)}")
+    # Always filter size 0 (302 redirects to nowhere)
+    if any(r["size"] == 0 for r in sample_results):
+        if "-fs" in base_filters:
+            idx = base_filters.index("-fs")
+            base_filters[idx + 1] = base_filters[idx + 1] + ",0"
+        else:
+            base_filters += ["-fs", "0"]
+        log(f"{indent}[*] Auto-filter size 0 (empty redirects)")
+
+    # ── AI Filter analysis
     if filter_flags is None:
-        filter_flags = []
+        filter_flags = list(base_filters)
         if sample_results:
             try:
-                filter_flags, fdata = analyze_and_filter(target_url, sample_results, ai)
-                log(f"{indent}[*] Filters: {fdata.get('filter_command', 'none')}")
+                ai_flags, fdata = analyze_and_filter(target_url, sample_results, ai)
+                # Merge AI flags with base filters, avoid duplicate -fs
+                filter_flags = _merge_filter_flags(base_filters, ai_flags)
+                log(f"{indent}[*] Filters: {' '.join(filter_flags) or 'none'}")
                 if fdata.get("real_findings"):
                     log(f"{indent}[*] Spotted in sample: {fdata['real_findings']}")
             except BudgetExhausted:
                 raise
             except Exception as e:
-                log(f"{indent}[!] Filter analysis failed ({e}) — continuing without filter")
+                log(f"{indent}[!] Filter analysis failed ({e}) — using base filters only")
 
     # ── Full run with filters
     log(f"{indent}[*] Full run with filters ...")
