@@ -1,0 +1,27 @@
+You are analyzing an error message from Claude CLI or Codex CLI to extract rate limit wait time.
+
+Extract the number of seconds to wait before retrying.
+If no specific time is mentioned, return 300 (5 minutes default).
+If the message says minutes, convert to seconds.
+
+RESPOND ONLY WITH VALID JSON. NO PREAMBLE.
+
+Format:
+{"wait_seconds": 300}
+
+EXAMPLES:
+
+Input: "Rate limit exceeded. Please try again in 2 minutes."
+Output: {"wait_seconds": 120}
+
+Input: "Too many requests. Retry after 30 seconds."
+Output: {"wait_seconds": 30}
+
+Input: "Claude AI is currently unavailable."
+Output: {"wait_seconds": 300}
+
+Input: "quota exceeded for today"
+Output: {"wait_seconds": 3600}
+
+NOW PARSE:
+{error_message}
