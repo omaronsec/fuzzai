@@ -265,6 +265,71 @@ def get_auto_severity(path):
     return None, None
 
 
+def sanitize_wordlist_entry(raw):
+    """Keep only path-like fuzz entries; drop comments, payloads, and junk."""
+    entry = raw.strip()
+    if not entry or entry.startswith("#"):
+        return None
+    if any(ch.isspace() for ch in entry):
+        return None
+    if entry.startswith(("'", '"', "*", "$", "(", "&", "=", "`")):
+        return None
+
+    lowered = entry.lower()
+    garbage_markers = (
+        "mozilla/",
+        "googlebot",
+        "ahrefsbot",
+        "bingbot",
+        "crawler",
+        "spider",
+        "wget",
+        "curl",
+        "http://",
+        "https://",
+        "() {",
+        "<",
+        ">",
+    )
+    if any(marker in lowered for marker in garbage_markers):
+        return None
+    if entry.startswith("////"):
+        return None
+    return entry
+
+
+def iter_sanitized_wordlist_entries(wordlist):
+    with open(wordlist) as wf:
+        for raw in wf:
+            entry = sanitize_wordlist_entry(raw)
+            if entry is not None:
+                yield entry
+
+
+def classify_garbage_candidate(path):
+    """Return a skip reason when a discovered candidate is clearly not a real path."""
+    if sanitize_wordlist_entry(path) is None:
+        return "invalid path token or reflected garbage"
+
+    lowered = path.lower()
+    if any(token in lowered for token in ("get /", "http/1.1", "admantx platform", "adodb.", "syntax error")):
+        return "server banner, log line, or error artifact"
+    if re.search(r"\b\d{1,3}(?:\.\d{1,3}){3}\b", path) and "-" in path:
+        return "crawler or log artifact"
+    return None
+
+
+def is_repeated_deny_fingerprint(status, size, fingerprint_counts):
+    """Generic 401/403 block pages often share the same status+size across fake names."""
+    return status in {401, 403} and fingerprint_counts.get((status, size), 0) >= 3
+
+
+def looks_like_html_error(snippet, status):
+    lowered = snippet.lower()
+    markers = ("not found", "404", "403 forbidden", "access denied", "error page", "<html", "<title>")
+    return status in {400, 401, 403, 404, 410, 500, 503} and any(marker in lowered for marker in markers)
+
+
 # ─────────────────────────────────────────
 #  STATE MANAGEMENT
 # ─────────────────────────────────────────
@@ -304,8 +369,7 @@ def save_finding(finding, domain_dir):
 # ─────────────────────────────────────────
 def count_wordlist_lines(wordlist):
     try:
-        result = subprocess.run(["wc", "-l", wordlist], capture_output=True, text=True)
-        return int(result.stdout.strip().split()[0])
+        return sum(1 for _ in iter_sanitized_wordlist_entries(wordlist))
     except Exception:
         return 10000
 
@@ -318,11 +382,15 @@ def run_ffuf(url, wordlist, extra_flags=None, threads=None, timeout_per_run=600)
 
     with tempfile.NamedTemporaryFile(suffix='.json', delete=False) as tf:
         out_file = tf.name
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as wf:
+        clean_wordlist = wf.name
+        for entry in iter_sanitized_wordlist_entries(wordlist):
+            wf.write(entry + "\n")
 
     cmd = [
         FFUF_BIN,
         "-u", url,
-        "-w", wordlist,
+        "-w", clean_wordlist,
         "-t", t,
         "-timeout", str(FFUF_TIMEOUT),
         "-mc", "200,201,204,301,302,307,401,403,405,500",
@@ -366,6 +434,8 @@ def run_ffuf(url, wordlist, extra_flags=None, threads=None, timeout_per_run=600)
     finally:
         if os.path.exists(out_file):
             os.unlink(out_file)
+        if os.path.exists(clean_wordlist):
+            os.unlink(clean_wordlist)
 
     return results, error_count, stderr_out
 
@@ -377,12 +447,11 @@ def run_ffuf_sampled(url, wordlist, sample_ratio=0.20, extra_flags=None, threads
 
     tmp = tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False)
     count = 0
-    with open(wordlist) as wf:
-        for line in wf:
-            if count >= sample_size:
-                break
-            tmp.write(line)
-            count += 1
+    for line in iter_sanitized_wordlist_entries(wordlist):
+        if count >= sample_size:
+            break
+        tmp.write(line + "\n")
+        count += 1
     tmp.close()
 
     try:
@@ -584,7 +653,7 @@ def fuzz_url(target_url, ai, domain_dir, state, depth=0, tech=None,
     base_filters = []
     sizes_in_sample = [r["size"] for r in sample_results]
     if sizes_in_sample:
-                size_counts = Counter(sizes_in_sample)
+        size_counts = Counter(sizes_in_sample)
         # Any size appearing on >30% of results is a catch-all — filter it
         threshold = max(5, int(len(sample_results) * 0.30))
         noisy_sizes = [str(s) for s, c in size_counts.items() if c >= threshold and s != 0]
@@ -635,14 +704,33 @@ def fuzz_url(target_url, ai, domain_dir, state, depth=0, tech=None,
             seen_paths.add(r["path"])
             unique_results.append(r)
 
+    fingerprint_counts = Counter((r["status"], r["size"]) for r in unique_results)
+
+    filtered_results = []
+    garbage_count = 0
+    garbage_examples = []
+    for r in unique_results:
+        reason = classify_garbage_candidate(r["path"])
+        if reason:
+            garbage_count += 1
+            if len(garbage_examples) < 5:
+                garbage_examples.append(f"{r['path']} ({reason})")
+            continue
+        filtered_results.append(r)
+
+    if garbage_count:
+        log(f"{indent}[*] Prefilter removed {garbage_count} garbage candidates before AI")
+        for example in garbage_examples:
+            log(f"{indent}    skip: {example}")
+
     # Save raw output
     raw_file = os.path.join(domain_dir, f"raw_depth{depth}.txt")
     with open(raw_file, 'w') as f:
-        f.write(results_to_text(unique_results))
-    log(f"{indent}[*] {len(unique_results)} unique results → {raw_file}")
+        f.write(results_to_text(filtered_results))
+    log(f"{indent}[*] {len(filtered_results)} unique results → {raw_file}")
 
     # ── Classify and act on each result
-    for r in unique_results:
+    for r in filtered_results:
         path   = r["path"]
         status = r["status"]
         size   = r["size"]
@@ -670,6 +758,9 @@ def fuzz_url(target_url, ai, domain_dir, state, depth=0, tech=None,
                 auto_sev, auto_title = get_auto_severity(path)
 
                 if auto_sev:
+                    if is_repeated_deny_fingerprint(status, size, fingerprint_counts):
+                        log(f"{indent}  [~] Skip {path}: repeated deny fingerprint ({status}/{size})")
+                        continue
                     # Known-sensitive extension — no AI needed, severity is deterministic
                     finding = {
                         "url":         full_url,
@@ -702,6 +793,10 @@ def fuzz_url(target_url, ai, domain_dir, state, depth=0, tech=None,
                         raise
                     except Exception as e:
                         log(f"{indent}  [!] Judge failed ({e}) — skipping")
+                        continue
+
+                    if looks_like_html_error(snippet, status):
+                        log(f"{indent}  [~] Skip {path}: HTML error page response")
                         continue
 
                     if judgment.get("worth_reporting"):
