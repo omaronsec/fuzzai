@@ -41,10 +41,57 @@ SENSITIVE_FILENAMES = {
     'secrets.yml', 'credentials.json',
 }
 
+# Deterministic severity — these never need AI to judge
+EXTENSION_AUTO_SEVERITY = {
+    '.env':      ('critical', 'Exposed Environment File'),
+    '.pem':      ('critical', 'Exposed Private Key'),
+    '.key':      ('critical', 'Exposed Private Key'),
+    '.p12':      ('critical', 'Exposed Certificate Bundle'),
+    '.pfx':      ('critical', 'Exposed Certificate Bundle'),
+    '.sql':      ('critical', 'Exposed Database Dump'),
+    '.dump':     ('critical', 'Exposed Database Dump'),
+    '.htpasswd': ('critical', 'Exposed Password File'),
+    '.db':       ('high',     'Exposed Database File'),
+    '.sqlite':   ('high',     'Exposed Database File'),
+    '.mdb':      ('high',     'Exposed Database File'),
+    '.zip':      ('high',     'Exposed Archive File'),
+    '.7z':       ('high',     'Exposed Archive File'),
+    '.rar':      ('high',     'Exposed Archive File'),
+    '.tar':      ('high',     'Exposed Archive File'),
+    '.tar.gz':   ('high',     'Exposed Archive File'),
+    '.tgz':      ('high',     'Exposed Archive File'),
+    '.bak':      ('high',     'Exposed Backup File'),
+    '.backup':   ('high',     'Exposed Backup File'),
+    '.gz':       ('medium',   'Exposed Compressed File'),
+    '.bz2':      ('medium',   'Exposed Compressed File'),
+    '.old':      ('medium',   'Exposed Old File'),
+    '.orig':     ('medium',   'Exposed Original File'),
+    '.save':     ('medium',   'Exposed Saved File'),
+    '.log':      ('medium',   'Exposed Log File'),
+    '.crt':      ('medium',   'Exposed Certificate'),
+    '.cer':      ('medium',   'Exposed Certificate'),
+}
+FILENAME_AUTO_SEVERITY = {
+    '.env':                    ('critical', 'Exposed Environment File'),
+    'wp-config.php':           ('critical', 'Exposed WordPress Config'),
+    'database.yml':            ('critical', 'Exposed Database Config'),
+    '.htpasswd':               ('critical', 'Exposed Password File'),
+    'secrets.yml':             ('critical', 'Exposed Secrets File'),
+    'credentials.json':        ('critical', 'Exposed Credentials File'),
+    'config.php':              ('high',     'Exposed PHP Config'),
+    'settings.py':             ('high',     'Exposed Django Settings'),
+    'application.properties':  ('high',     'Exposed Spring Config'),
+}
+
 # ─────────────────────────────────────────
 #  AI BUDGET  (reset per domain in main)
 # ─────────────────────────────────────────
 _ai_budget = {"calls": 0, "max": MAX_AI_CALLS, "domain": ""}
+
+
+class BudgetExhausted(Exception):
+    """Raised when per-domain AI call budget is exceeded."""
+    pass
 
 
 # ─────────────────────────────────────────
@@ -74,7 +121,7 @@ def ask_ai(prompt, ai="claude", retries=3):
     """Call claude or codex CLI subprocess."""
     _ai_budget["calls"] += 1
     if _ai_budget["calls"] > _ai_budget["max"]:
-        raise RuntimeError(
+        raise BudgetExhausted(
             f"AI budget exhausted ({_ai_budget['max']} calls) for {_ai_budget['domain']}"
         )
 
@@ -201,6 +248,20 @@ def is_sensitive_by_extension(path):
             return True
     filename = p.rstrip('/').split('/')[-1]
     return filename in SENSITIVE_FILENAMES
+
+
+def get_auto_severity(path):
+    """Return (severity, title) for known-sensitive paths — no AI call needed.
+    Returns (None, None) if path requires AI judgment.
+    """
+    p = path.lower().split('?')[0]
+    filename = p.rstrip('/').split('/')[-1]
+    if filename in FILENAME_AUTO_SEVERITY:
+        return FILENAME_AUTO_SEVERITY[filename]
+    for ext, val in EXTENSION_AUTO_SEVERITY.items():
+        if p.endswith(ext):
+            return val
+    return None, None
 
 
 # ─────────────────────────────────────────
@@ -548,53 +609,67 @@ def fuzz_url(target_url, ai, domain_dir, state, depth=0, tech=None,
                 action = "interesting_file"
                 log(f"{indent}  → {path} [{status}] = interesting_file (extension — no AI used)")
             else:
-                try:
-                    classification = classify_path(
-                        base_url, path, status, size, words, resp_headers, redirect, ai
-                    )
-                    action   = classification.get("action", "skip")
-                    priority = classification.get("priority", "low")
-                    reason   = classification.get("reason", "")
-                    log(f"{indent}  → {path} [{status}] = {action} ({priority}) | {reason}")
-                except RuntimeError as e:
-                    if "budget exhausted" in str(e):
-                        log(f"{indent}  [!] {e} — stopping")
-                        break
-                    raise
+                classification = classify_path(
+                    base_url, path, status, size, words, resp_headers, redirect, ai
+                )
+                action   = classification.get("action", "skip")
+                priority = classification.get("priority", "low")
+                reason   = classification.get("reason", "")
+                log(f"{indent}  → {path} [{status}] = {action} ({priority}) | {reason}")
 
             # ── interesting_file
             if action == "interesting_file":
-                snippet = ""
-                try:
-                    resp = requests.get(full_url, timeout=10,
-                                        headers={"User-Agent": "Mozilla/5.0"})
-                    snippet = resp.text[:500]
-                except Exception:
-                    pass
+                auto_sev, auto_title = get_auto_severity(path)
 
-                try:
-                    judgment = judge_finding(path, status, size, snippet, tech,
-                                             parsed.netloc, ai)
-                except Exception as e:
-                    log(f"{indent}  [!] Judge failed ({e}) — skipping")
-                    continue
-
-                if judgment.get("worth_reporting"):
-                    sev = judgment.get("severity", "info")
+                if auto_sev:
+                    # Known-sensitive extension — no AI needed, severity is deterministic
                     finding = {
                         "url":         full_url,
                         "path":        path,
                         "status":      status,
                         "size":        size,
-                        "severity":    sev,
-                        "title":       judgment.get("title", path),
-                        "description": judgment.get("description", ""),
-                        "impact":      judgment.get("impact", ""),
-                        "steps":       judgment.get("steps", [])
+                        "severity":    auto_sev,
+                        "title":       auto_title,
+                        "description": f"Sensitive file publicly accessible at {path}",
+                        "impact":      f"{auto_title} exposed without authentication",
+                        "steps":       [f"GET {path}"]
                     }
                     findings.append(finding)
                     save_finding(finding, domain_dir)
-                    log(f"{indent}  [!!!] FINDING [{sev.upper()}]: {finding['title']}")
+                    log(f"{indent}  [!!!] FINDING [{auto_sev.upper()}]: {auto_title} (auto-detected, no AI used)")
+                else:
+                    # Unknown extension — use AI to judge
+                    snippet = ""
+                    try:
+                        resp = requests.get(full_url, timeout=10,
+                                            headers={"User-Agent": "Mozilla/5.0"})
+                        snippet = resp.text[:500]
+                    except Exception:
+                        pass
+
+                    try:
+                        judgment = judge_finding(path, status, size, snippet, tech,
+                                                 parsed.netloc, ai)
+                    except Exception as e:
+                        log(f"{indent}  [!] Judge failed ({e}) — skipping")
+                        continue
+
+                    if judgment.get("worth_reporting"):
+                        sev = judgment.get("severity", "info")
+                        finding = {
+                            "url":         full_url,
+                            "path":        path,
+                            "status":      status,
+                            "size":        size,
+                            "severity":    sev,
+                            "title":       judgment.get("title", path),
+                            "description": judgment.get("description", ""),
+                            "impact":      judgment.get("impact", ""),
+                            "steps":       judgment.get("steps", [])
+                        }
+                        findings.append(finding)
+                        save_finding(finding, domain_dir)
+                        log(f"{indent}  [!!!] FINDING [{sev.upper()}]: {finding['title']}")
 
             # ── go_deeper
             elif action == "go_deeper" and depth < MAX_DEPTH:
@@ -787,25 +862,50 @@ def main():
 
         logger = DomainLogger(domain_dir)
 
+        logger.log(f"TARGET: {domain_url}")
+
         try:
             findings = fuzz_url(
                 domain_url, args.ai, domain_dir, state,
                 threads=args.threads, logger=logger
             )
             all_findings.extend(findings)
-            print(f"\n[+] Done: {domain_url} | Findings: {len(findings)} | AI calls used: {_ai_budget['calls']}/{args.ai_budget}")
+            msg = f"Done: {domain_url} | Findings: {len(findings)} | AI calls: {_ai_budget['calls']}/{args.ai_budget}"
+            print(f"\n[+] {msg}")
+            logger.log(msg)
 
+            state["completed"].append(domain_url)
+            state["current"] = None
+            save_state(state, args.output)
+
+        except BudgetExhausted as e:
+            # Reload findings.json — save_finding() wrote each hit as it was found
+            partial = []
+            pf = os.path.join(domain_dir, "findings.json")
+            if os.path.exists(pf):
+                try:
+                    with open(pf) as f:
+                        partial = json.load(f)
+                except Exception:
+                    pass
+            all_findings.extend(partial)
+            warn = f"BUDGET EXHAUSTED — {domain_url} processed partially ({_ai_budget['calls']} calls). {len(partial)} findings saved. Increase --ai-budget to fully process."
+            print(f"\n[!] {warn}")
+            logger.log(f"WARNING: {warn}")
+            # Still mark completed — retrying would just exhaust budget again
             state["completed"].append(domain_url)
             state["current"] = None
             save_state(state, args.output)
 
         except KeyboardInterrupt:
             print("\n[!] Interrupted — state saved. Run same command to resume.")
+            logger.log("INTERRUPTED by user")
             state["queue"].insert(0, domain_url)
             save_state(state, args.output)
             sys.exit(0)
         except Exception as e:
             print(f"[!] Error on {domain_url}: {e} — moved to end of queue for retry")
+            logger.log(f"ERROR: {e} — requeued")
             state["queue"].append(domain_url)
             state["current"] = None
             save_state(state, args.output)
