@@ -24,12 +24,60 @@ FFUF_THREADS  = 40
 FFUF_TIMEOUT  = 10
 SAMPLE_RATIO  = 0.20
 MAX_DEPTH     = 3
+MAX_AI_CALLS  = 50   # per domain, overridden by --ai-budget
+
+# Extensions/filenames that are always interesting — skip AI classification
+SENSITIVE_EXTENSIONS = {
+    '.zip', '.tar', '.tar.gz', '.tgz', '.gz', '.bz2', '.7z', '.rar',
+    '.sql', '.db', '.sqlite', '.dump', '.mdb',
+    '.env', '.bak', '.old', '.backup', '.orig', '.save',
+    '.pem', '.key', '.p12', '.pfx', '.crt', '.cer',
+    '.log',
+    '.htpasswd',
+}
+SENSITIVE_FILENAMES = {
+    '.env', 'wp-config.php', 'database.yml', '.htpasswd',
+    'config.php', 'settings.py', 'application.properties',
+    'secrets.yml', 'credentials.json',
+}
+
+# ─────────────────────────────────────────
+#  AI BUDGET  (reset per domain in main)
+# ─────────────────────────────────────────
+_ai_budget = {"calls": 0, "max": MAX_AI_CALLS, "domain": ""}
+
+
+# ─────────────────────────────────────────
+#  DOMAIN LOGGER
+# ─────────────────────────────────────────
+class DomainLogger:
+    def __init__(self, domain_dir):
+        log_path = os.path.join(domain_dir, "run.log")
+        self._f = open(log_path, 'a')
+        self._f.write(f"\n{'='*60}\n[{datetime.now().isoformat()}] RUN START\n{'='*60}\n")
+        self._f.flush()
+
+    def log(self, msg):
+        ts = datetime.now().strftime("%H:%M:%S")
+        self._f.write(f"[{ts}] {msg}\n")
+        self._f.flush()
+
+    def close(self):
+        self._f.write(f"[{datetime.now().strftime('%H:%M:%S')}] RUN END\n")
+        self._f.close()
+
 
 # ─────────────────────────────────────────
 #  AI BRAIN
 # ─────────────────────────────────────────
 def ask_ai(prompt, ai="claude", retries=3):
     """Call claude or codex CLI subprocess."""
+    _ai_budget["calls"] += 1
+    if _ai_budget["calls"] > _ai_budget["max"]:
+        raise RuntimeError(
+            f"AI budget exhausted ({_ai_budget['max']} calls) for {_ai_budget['domain']}"
+        )
+
     for attempt in range(retries):
         try:
             cmd = ["claude", "-p", prompt] if ai == "claude" else ["codex", prompt]
@@ -74,19 +122,16 @@ def load_prompt(name, **kwargs):
 
 def extract_json(text):
     """Extract first valid JSON object from AI response."""
-    # Direct parse
     try:
         return json.loads(text)
     except Exception:
         pass
-    # Markdown code block
     match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', text, re.DOTALL)
     if match:
         try:
             return json.loads(match.group(1))
         except Exception:
             pass
-    # Raw scan for first { ... }
     start = text.find('{')
     end   = text.rfind('}') + 1
     if start != -1 and end > start:
@@ -131,28 +176,31 @@ def fetch_headers(url):
         return {}, ""
 
 
-def is_blocked(lines, errors, stderr=""):
-    """Detect WAF/rate-limit blocking from ffuf output."""
+def is_blocked(results, errors, stderr=""):
+    """Detect WAF/rate-limit blocking from ffuf results."""
     if errors > 10:
         return True
-    # Check stderr for block indicators
     if stderr:
         block_patterns = ["cloudflare", "captcha", "access denied", "waf", "blocked",
                           "rate limit", "too many requests", "forbidden by policy"]
-        sl = stderr.lower()
-        if any(p in sl for p in block_patterns):
+        if any(p in stderr.lower() for p in block_patterns):
             return True
-    if not lines:
+    if not results:
         return False
-    # All responses same size 0 or all 429/503
-    statuses = []
-    for line in lines[:20]:
-        m = re.search(r'Status:\s*(\d+)', line)
-        if m:
-            statuses.append(int(m.group(1)))
+    statuses = [r["status"] for r in results[:20]]
     if statuses and all(s in [429, 503, 0] for s in statuses):
         return True
     return False
+
+
+def is_sensitive_by_extension(path):
+    """Deterministically flag paths with sensitive extensions — no AI needed."""
+    p = path.lower().split('?')[0]
+    for ext in SENSITIVE_EXTENSIONS:
+        if p.endswith(ext):
+            return True
+    filename = p.rstrip('/').split('/')[-1]
+    return filename in SENSITIVE_FILENAMES
 
 
 # ─────────────────────────────────────────
@@ -163,11 +211,7 @@ def load_state(results_dir):
     if os.path.exists(state_file):
         with open(state_file) as f:
             return json.load(f)
-    return {
-        "completed": [],
-        "queue": [],
-        "current": None
-    }
+    return {"completed": [], "queue": [], "current": None}
 
 
 def save_state(state, results_dir):
@@ -186,16 +230,15 @@ def save_finding(finding, domain_dir):
                 existing = json.load(f)
         except Exception:
             pass
-    existing_urls = {f.get("url") for f in existing}
-    if finding.get("url") in existing_urls:
-        return  # already saved
+    if finding.get("url") in {f.get("url") for f in existing}:
+        return
     existing.append(finding)
     with open(findings_file, 'w') as f:
         json.dump(existing, f, indent=2)
 
 
 # ─────────────────────────────────────────
-#  FFUF RUNNER
+#  FFUF RUNNER  (JSON output mode)
 # ─────────────────────────────────────────
 def count_wordlist_lines(wordlist):
     try:
@@ -206,42 +249,63 @@ def count_wordlist_lines(wordlist):
 
 
 def run_ffuf(url, wordlist, extra_flags=None, threads=None, timeout_per_run=600):
-    """Run ffuf and return (lines, error_count, stderr)."""
+    """Run ffuf and return (results, error_count, stderr).
+    results: list of dicts — path, status, size, words, lines, url
+    """
     t = str(threads or FFUF_THREADS)
+
+    with tempfile.NamedTemporaryFile(suffix='.json', delete=False) as tf:
+        out_file = tf.name
+
     cmd = [
         FFUF_BIN,
         "-u", url,
         "-w", wordlist,
         "-t", t,
         "-timeout", str(FFUF_TIMEOUT),
-        "-s",
-        "-mc", "200,201,204,301,302,307,401,403,405,500"
+        "-mc", "200,201,204,301,302,307,401,403,405,500",
+        "-o", out_file,
+        "-of", "json",
+        "-s"
     ]
     if extra_flags:
         cmd += extra_flags
 
-    lines = []
+    results     = []
     error_count = 0
-    stderr_out = ""
+    stderr_out  = ""
 
     try:
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        stdout_data, stderr_out = proc.communicate(timeout=timeout_per_run)
-        for line in stdout_data.splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            lines.append(line)
-            if re.search(r'status:\s*0|connection refused|no route to host', line, re.I):
-                error_count += 1
-        # Also count errors from stderr
+        _, stderr_out = proc.communicate(timeout=timeout_per_run)
+
+        if os.path.exists(out_file):
+            try:
+                with open(out_file) as f:
+                    data = json.load(f)
+                for r in data.get("results", []):
+                    results.append({
+                        "path":   r.get("input", {}).get("FUZZ", ""),
+                        "status": r.get("status", 0),
+                        "size":   r.get("length", 0),
+                        "words":  r.get("words", 0),
+                        "lines":  r.get("lines", 0),
+                        "url":    r.get("url", "")
+                    })
+            except Exception:
+                pass
+
         for sline in stderr_out.splitlines():
             if re.search(r'error|failed|refused|timeout', sline, re.I):
                 error_count += 1
+
     except subprocess.TimeoutExpired:
         proc.kill()
+    finally:
+        if os.path.exists(out_file):
+            os.unlink(out_file)
 
-    return lines, error_count, stderr_out
+    return results, error_count, stderr_out
 
 
 def run_ffuf_sampled(url, wordlist, sample_ratio=0.20, extra_flags=None, threads=None):
@@ -251,8 +315,8 @@ def run_ffuf_sampled(url, wordlist, sample_ratio=0.20, extra_flags=None, threads
 
     tmp = tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False)
     count = 0
-    with open(wordlist) as f:
-        for line in f:
+    with open(wordlist) as wf:
+        for line in wf:
             if count >= sample_size:
                 break
             tmp.write(line)
@@ -260,28 +324,22 @@ def run_ffuf_sampled(url, wordlist, sample_ratio=0.20, extra_flags=None, threads
     tmp.close()
 
     try:
-        lines, errors, stderr = run_ffuf(url, tmp.name, extra_flags=extra_flags, threads=threads)
+        results, errors, stderr = run_ffuf(url, tmp.name, extra_flags=extra_flags, threads=threads)
     finally:
         if os.path.exists(tmp.name):
             os.unlink(tmp.name)
-    return lines, errors, total, stderr
+    return results, errors, total, stderr
 
 
-def parse_ffuf_line(line):
-    """Parse one line of ffuf -s output."""
-    m = re.search(
-        r'^(.+?)\s+\[Status:\s*(\d+),\s*Size:\s*(\d+),\s*Words:\s*(\d+),\s*Lines:\s*(\d+)',
-        line
-    )
-    if m:
-        return {
-            "path":   m.group(1).strip(),
-            "status": int(m.group(2)),
-            "size":   int(m.group(3)),
-            "words":  int(m.group(4)),
-            "lines":  int(m.group(5))
-        }
-    return None
+def results_to_text(results):
+    """Convert result dicts to text lines for AI prompts and raw output files."""
+    lines = []
+    for r in results:
+        lines.append(
+            f"{r['path']} [Status: {r['status']}, Size: {r['size']}, "
+            f"Words: {r['words']}, Lines: {r['lines']}]"
+        )
+    return "\n".join(lines)
 
 
 # ─────────────────────────────────────────
@@ -298,7 +356,7 @@ def tech_detect(url, ai):
 
 
 def analyze_and_filter(url, results, ai):
-    results_text = "\n".join(results[:200])   # cap to avoid huge prompt
+    results_text = results_to_text(results[:200])
     prompt = load_prompt("filter_analysis.prompt", url=url, results=results_text)
     out = ask_ai(prompt, ai=ai)
     data = extract_json(out)
@@ -307,7 +365,7 @@ def analyze_and_filter(url, results, ai):
     except ValueError:
         data["filter_command"] = ""
     filter_cmd = data.get("filter_command", "")
-    # Only allow safe ffuf filter flags — no shell injection
+    # Whitelist-only flag parsing — no shell injection from AI output
     allowed_flags = {"-fs", "-fw", "-fl", "-fc", "-fr", "-mc"}
     raw_flags = filter_cmd.split() if filter_cmd else []
     flags = []
@@ -315,7 +373,7 @@ def analyze_and_filter(url, results, ai):
     while i < len(raw_flags):
         if raw_flags[i] in allowed_flags and i + 1 < len(raw_flags):
             val = raw_flags[i + 1]
-            if re.match(r'^[\d,]+$', val):   # only digits and commas
+            if re.match(r'^[\d,]+$', val):
                 flags += [raw_flags[i], val]
             i += 2
         else:
@@ -350,14 +408,13 @@ def generate_param_wordlist(url, endpoint, tech, status, resp_headers, ai):
     if not isinstance(params, list):
         params = []
     if not params:
-        # fallback to burp list
         return f"{WORDLISTS_DIR}/parameters/burp-parameter-names.txt", data, False
 
     tmp = tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False)
     for p in params:
         tmp.write(p.strip() + "\n")
     tmp.close()
-    return tmp.name, data, True   # True = caller must delete this file
+    return tmp.name, data, True
 
 
 def judge_finding(finding, status, size, response_snippet, tech, domain, ai):
@@ -374,12 +431,18 @@ def judge_finding(finding, status, size, response_snippet, tech, domain, ai):
 # ─────────────────────────────────────────
 #  DOMAIN FUZZER
 # ─────────────────────────────────────────
-def fuzz_url(target_url, ai, domain_dir, state, depth=0, tech=None, filter_flags=None, threads=None, _visited=None):
+def fuzz_url(target_url, ai, domain_dir, state, depth=0, tech=None,
+             filter_flags=None, threads=None, _visited=None, logger=None):
     """
     Recursive fuzzer for a single URL level.
     Returns list of findings.
     _visited: in-memory set for recursion dedup — never persisted to state.
     """
+    def log(msg):
+        print(msg)
+        if logger:
+            logger.log(msg)
+
     if depth > MAX_DEPTH:
         return []
 
@@ -391,92 +454,86 @@ def fuzz_url(target_url, ai, domain_dir, state, depth=0, tech=None, filter_flags
     base_url = f"{parsed.scheme}://{parsed.netloc}"
     fuzz_target = target_url.rstrip('/') + "/FUZZ"
 
-    # Skip already visited within this domain run (prevents recursion loops)
     if fuzz_target in _visited:
-        print(f"{'  '*depth}[~] Already visited: {fuzz_target} — skip")
+        log(f"{'  '*depth}[~] Already visited: {fuzz_target} — skip")
         return []
     _visited.add(fuzz_target)
 
     indent = "  " * depth
-    print(f"\n{indent}[+] Fuzzing depth {depth}: {target_url}")
+    log(f"\n{indent}[+] Fuzzing depth {depth}: {target_url}")
 
     # ── Tech detect (only at depth 0)
     if tech is None:
         try:
             tech = tech_detect(target_url, ai)
-            print(f"{indent}[*] Tech: {tech.get('technologies')} → {tech.get('primary_wordlist')}")
+            log(f"{indent}[*] Tech: {tech.get('technologies')} → {tech.get('primary_wordlist')}")
         except Exception as e:
-            print(f"{indent}[!] Tech detect failed ({e}) — using default wordlist")
+            log(f"{indent}[!] Tech detect failed ({e}) — using default wordlist")
             tech = {"primary_wordlist": f"{WORDLISTS_DIR}/general/onelistforallmicro.txt"}
 
     wordlist = tech.get("primary_wordlist", f"{WORDLISTS_DIR}/general/onelistforallmicro.txt")
     if not os.path.exists(wordlist):
-        print(f"{indent}[!] Wordlist not found: {wordlist} — using default")
+        log(f"{indent}[!] Wordlist not found: {wordlist} — using default")
         wordlist = f"{WORDLISTS_DIR}/general/onelistforallmicro.txt"
 
     # ── 20% sample
-    print(f"{indent}[*] 20% sample run ...")
-    sample_lines, errors, total, stderr = run_ffuf_sampled(
+    log(f"{indent}[*] 20% sample run ...")
+    sample_results, errors, total, stderr = run_ffuf_sampled(
         fuzz_target, wordlist, SAMPLE_RATIO, threads=threads
     )
 
     # WAF check
-    if is_blocked(sample_lines, errors, stderr):
-        print(f"{indent}[!] Possible block detected. Retrying slow (-t 5 -p 1-3) ...")
-        sample_lines, errors, total, stderr = run_ffuf_sampled(
+    if is_blocked(sample_results, errors, stderr):
+        log(f"{indent}[!] Possible block detected. Retrying slow (-t 5 -p 1-3) ...")
+        sample_results, errors, total, stderr = run_ffuf_sampled(
             fuzz_target, wordlist, SAMPLE_RATIO,
             extra_flags=["-p", "1-3"], threads=5
         )
-        if is_blocked(sample_lines, errors, stderr):
-            print(f"{indent}[!] Still blocked — skipping {target_url}")
+        if is_blocked(sample_results, errors, stderr):
+            log(f"{indent}[!] Still blocked — skipping {target_url}")
             return []
 
-    print(f"{indent}[*] Sample: {len(sample_lines)} hits from ~{int(total*SAMPLE_RATIO)} reqs")
+    log(f"{indent}[*] Sample: {len(sample_results)} hits from ~{int(total*SAMPLE_RATIO)} reqs")
 
     # ── Filter analysis
     if filter_flags is None:
         filter_flags = []
-        if sample_lines:
+        if sample_results:
             try:
-                filter_flags, fdata = analyze_and_filter(target_url, sample_lines, ai)
-                print(f"{indent}[*] Filters: {fdata.get('filter_command', 'none')}")
+                filter_flags, fdata = analyze_and_filter(target_url, sample_results, ai)
+                log(f"{indent}[*] Filters: {fdata.get('filter_command', 'none')}")
                 if fdata.get("real_findings"):
-                    print(f"{indent}[*] Spotted in sample: {fdata['real_findings']}")
+                    log(f"{indent}[*] Spotted in sample: {fdata['real_findings']}")
             except Exception as e:
-                print(f"{indent}[!] Filter analysis failed ({e}) — continuing without filter")
+                log(f"{indent}[!] Filter analysis failed ({e}) — continuing without filter")
 
     # ── Full run with filters
-    print(f"{indent}[*] Full run with filters ...")
-    full_lines, _, _ = run_ffuf(fuzz_target, wordlist, extra_flags=filter_flags, threads=threads)
+    log(f"{indent}[*] Full run with filters ...")
+    full_results, _, _ = run_ffuf(fuzz_target, wordlist, extra_flags=filter_flags, threads=threads)
 
     # ── Sensitive wordlist pass
     sensitive_wl = f"{WORDLISTS_DIR}/sensitive/sensitive-combined.txt"
     if os.path.exists(sensitive_wl):
-        print(f"{indent}[*] Sensitive wordlist pass ...")
-        sens_lines, _, _ = run_ffuf(fuzz_target, sensitive_wl, extra_flags=filter_flags, threads=threads)
-        full_lines += sens_lines
+        log(f"{indent}[*] Sensitive wordlist pass ...")
+        sens_results, _, _ = run_ffuf(fuzz_target, sensitive_wl, extra_flags=filter_flags, threads=threads)
+        full_results += sens_results
 
-    # Deduplicate results
+    # Deduplicate by path
     seen_paths = set()
-    unique_lines = []
-    for line in full_lines:
-        r = parse_ffuf_line(line)
-        if r and r["path"] not in seen_paths:
+    unique_results = []
+    for r in full_results:
+        if r["path"] and r["path"] not in seen_paths:
             seen_paths.add(r["path"])
-            unique_lines.append(line)
+            unique_results.append(r)
 
-    # Save raw
+    # Save raw output
     raw_file = os.path.join(domain_dir, f"raw_depth{depth}.txt")
     with open(raw_file, 'w') as f:
-        f.write("\n".join(unique_lines))
-    print(f"{indent}[*] {len(unique_lines)} unique results saved → {raw_file}")
+        f.write(results_to_text(unique_results))
+    log(f"{indent}[*] {len(unique_results)} unique results → {raw_file}")
 
-    # ── Classify and act
-    for line in unique_lines:
-        r = parse_ffuf_line(line)
-        if not r:
-            continue
-
+    # ── Classify and act on each result
+    for r in unique_results:
         path   = r["path"]
         status = r["status"]
         size   = r["size"]
@@ -484,15 +541,26 @@ def fuzz_url(target_url, ai, domain_dir, state, depth=0, tech=None, filter_flags
         full_url = base_url + "/" + path.lstrip("/")
 
         try:
-            # Get real headers + redirect for this specific result
             resp_headers, redirect = fetch_headers(full_url)
 
-            classification = classify_path(
-                base_url, path, status, size, words, resp_headers, redirect, ai
-            )
-            action   = classification.get("action", "skip")
-            priority = classification.get("priority", "low")
-            print(f"{indent}  → {path} [{status}] = {action} ({priority})")
+            # Deterministic extension check — no AI call needed
+            if is_sensitive_by_extension(path):
+                action = "interesting_file"
+                log(f"{indent}  → {path} [{status}] = interesting_file (extension — no AI used)")
+            else:
+                try:
+                    classification = classify_path(
+                        base_url, path, status, size, words, resp_headers, redirect, ai
+                    )
+                    action   = classification.get("action", "skip")
+                    priority = classification.get("priority", "low")
+                    reason   = classification.get("reason", "")
+                    log(f"{indent}  → {path} [{status}] = {action} ({priority}) | {reason}")
+                except RuntimeError as e:
+                    if "budget exhausted" in str(e):
+                        log(f"{indent}  [!] {e} — stopping")
+                        break
+                    raise
 
             # ── interesting_file
             if action == "interesting_file":
@@ -508,7 +576,7 @@ def fuzz_url(target_url, ai, domain_dir, state, depth=0, tech=None, filter_flags
                     judgment = judge_finding(path, status, size, snippet, tech,
                                              parsed.netloc, ai)
                 except Exception as e:
-                    print(f"{indent}  [!] Judge failed ({e}) — skipping")
+                    log(f"{indent}  [!] Judge failed ({e}) — skipping")
                     continue
 
                 if judgment.get("worth_reporting"):
@@ -526,15 +594,16 @@ def fuzz_url(target_url, ai, domain_dir, state, depth=0, tech=None, filter_flags
                     }
                     findings.append(finding)
                     save_finding(finding, domain_dir)
-                    print(f"{indent}  [!!!] FINDING [{sev.upper()}]: {finding['title']}")
+                    log(f"{indent}  [!!!] FINDING [{sev.upper()}]: {finding['title']}")
 
             # ── go_deeper
             elif action == "go_deeper" and depth < MAX_DEPTH:
                 sub_url = base_url + "/" + path.lstrip("/").rstrip("/")
+                log(f"{indent}  [>] Recursing into: {sub_url}")
                 sub_findings = fuzz_url(
                     sub_url, ai, domain_dir, state,
-                    depth=depth + 1, tech=tech, filter_flags=filter_flags, threads=threads,
-                    _visited=_visited
+                    depth=depth + 1, tech=tech, filter_flags=filter_flags,
+                    threads=threads, _visited=_visited, logger=logger
                 )
                 findings.extend(sub_findings)
 
@@ -544,30 +613,24 @@ def fuzz_url(target_url, ai, domain_dir, state, depth=0, tech=None, filter_flags
                     base_url, path, tech, status, resp_headers, ai
                 )
                 total_params = param_data.get("total_params", "?")
-                print(f"{indent}  [*] Param fuzzing {path} ({total_params} params) ...")
+                log(f"{indent}  [*] Param fuzzing {path} ({total_params} params) ...")
 
                 try:
-                    # Pass 1: fuzz param name with test value — find what params exist
-                    param_fuzz_url = full_url + "?FUZZ=testvalue"
-                    p1_lines, _, _ = run_ffuf(
-                        param_fuzz_url, param_file,
-                        extra_flags=filter_flags,
-                        threads=threads
+                    # Pass 1: find what params exist
+                    p1_results, _, _ = run_ffuf(
+                        full_url + "?FUZZ=testvalue", param_file,
+                        extra_flags=filter_flags, threads=threads
+                    )
+                    # Pass 2: find file-read params
+                    p2_results, _, _ = run_ffuf(
+                        full_url + "?FUZZ=../../etc/passwd", param_file,
+                        extra_flags=["-mr", "root:x:"], threads=threads
                     )
 
-                    # Pass 2: fuzz param name with traversal value — find file-read params
-                    traverse_fuzz_url = full_url + "?FUZZ=../../etc/passwd"
-                    p2_lines, _, _ = run_ffuf(
-                        traverse_fuzz_url, param_file,
-                        extra_flags=["-mr", "root:x:"],
-                        threads=threads
-                    )
+                    tagged = ([(r, "testvalue") for r in p1_results] +
+                              [(r, "../../etc/passwd") for r in p2_results])
 
-                    # Tag each line with the test value that found it
-                    tagged = ([(l, "testvalue") for l in p1_lines] +
-                              [(l, "../../etc/passwd") for l in p2_lines])
-
-                    # Parse baseline sizes from filter flags — handle comma-separated values
+                    # Parse baseline sizes from filter flags
                     baseline_sizes = set()
                     for m in re.finditer(r'-fs\s+([\d,]+)', " ".join(filter_flags)):
                         for val in m.group(1).split(','):
@@ -577,38 +640,36 @@ def fuzz_url(target_url, ai, domain_dir, state, depth=0, tech=None, filter_flags
                                 pass
 
                     seen_params = set()
-                    for pline, test_val in tagged:
-                        pd = parse_ffuf_line(pline)
-                        if not pd:
-                            continue
-                        param_name = pd["path"]
-                        if param_name in seen_params:
+                    for pr, test_val in tagged:
+                        param_name = pr["path"]
+                        if not param_name or param_name in seen_params:
                             continue
                         seen_params.add(param_name)
-                        param_path = f"{path}?{param_name}={test_val}"
 
-                        # Only save if response is meaningfully different (not same size as baseline)
-                        if baseline_sizes and pd["size"] in baseline_sizes:
+                        if baseline_sizes and pr["size"] in baseline_sizes:
                             continue
 
-                        # Let AI judge if this param finding is worth reporting
+                        param_path = f"{path}?{param_name}={test_val}"
+
                         try:
                             psnippet = ""
                             try:
-                                pr = requests.get(f"{full_url}?{param_name}={test_val}",
-                                                  timeout=8, headers={"User-Agent": "Mozilla/5.0"})
-                                psnippet = pr.text[:300]
+                                resp = requests.get(
+                                    f"{full_url}?{param_name}={test_val}",
+                                    timeout=8, headers={"User-Agent": "Mozilla/5.0"}
+                                )
+                                psnippet = resp.text[:300]
                             except Exception:
                                 pass
 
-                            pjudge = judge_finding(param_path, pd["status"], pd["size"],
+                            pjudge = judge_finding(param_path, pr["status"], pr["size"],
                                                    psnippet, tech, parsed.netloc, ai)
                             if pjudge.get("worth_reporting"):
                                 pfinding = {
                                     "url":         base_url + "/" + param_path.lstrip("/"),
                                     "path":        param_path,
-                                    "status":      pd["status"],
-                                    "size":        pd["size"],
+                                    "status":      pr["status"],
+                                    "size":        pr["size"],
                                     "severity":    pjudge.get("severity", "medium"),
                                     "title":       pjudge.get("title", f"Parameter: {param_name}"),
                                     "description": pjudge.get("description", ""),
@@ -617,16 +678,16 @@ def fuzz_url(target_url, ai, domain_dir, state, depth=0, tech=None, filter_flags
                                 }
                                 findings.append(pfinding)
                                 save_finding(pfinding, domain_dir)
-                                print(f"{indent}  [!!!] PARAM FINDING [{pfinding['severity'].upper()}]: {pfinding['title']}")
+                                log(f"{indent}  [!!!] PARAM [{pfinding['severity'].upper()}]: {pfinding['title']}")
                         except Exception as e:
-                            print(f"{indent}  [!] Param judge failed ({e})")
+                            log(f"{indent}  [!] Param judge failed ({e})")
 
                 finally:
                     if is_temp and os.path.exists(param_file):
                         os.unlink(param_file)
 
         except Exception as e:
-            print(f"{indent}  [!] Error on {path}: {e}")
+            log(f"{indent}  [!] Error on {path}: {e}")
             continue
 
     return findings
@@ -636,31 +697,32 @@ def fuzz_url(target_url, ai, domain_dir, state, depth=0, tech=None, filter_flags
 #  MAIN
 # ─────────────────────────────────────────
 def main():
-    global FFUF_THREADS, MAX_DEPTH
+    global FFUF_THREADS, MAX_DEPTH, MAX_AI_CALLS
     parser = argparse.ArgumentParser(
         description="fuzzai — AI-powered web fuzzer for file & param discovery"
     )
-    parser.add_argument("-u", "--url",     help="Single target URL")
-    parser.add_argument("-l", "--list",    help="File with list of URLs/domains")
-    parser.add_argument("--ai",            choices=["claude", "codex"], default="claude",
+    parser.add_argument("-u", "--url",      help="Single target URL")
+    parser.add_argument("-l", "--list",     help="File with list of URLs/domains")
+    parser.add_argument("--ai",             choices=["claude", "codex"], default="claude",
                         help="AI provider (default: claude)")
-    parser.add_argument("--threads",       type=int, default=FFUF_THREADS,
+    parser.add_argument("--threads",        type=int, default=FFUF_THREADS,
                         help=f"ffuf threads (default: {FFUF_THREADS})")
-    parser.add_argument("--depth",         type=int, default=MAX_DEPTH,
+    parser.add_argument("--depth",          type=int, default=MAX_DEPTH,
                         help=f"Max recursion depth (default: {MAX_DEPTH})")
-    parser.add_argument("--output",        default=RESULTS_DIR,
+    parser.add_argument("--output",         default=RESULTS_DIR,
                         help=f"Output dir (default: {RESULTS_DIR})")
+    parser.add_argument("--ai-budget",      type=int, default=MAX_AI_CALLS,
+                        help=f"Max AI calls per domain (default: {MAX_AI_CALLS})")
     args = parser.parse_args()
 
     if not args.url and not args.list:
         parser.print_help()
         sys.exit(1)
 
-    # Wire CLI args into runtime globals
     FFUF_THREADS = args.threads
     MAX_DEPTH    = args.depth
+    MAX_AI_CALLS = args.ai_budget
 
-    # Build domain queue
     domains = []
     if args.url:
         url = args.url if args.url.startswith("http") else "https://" + args.url
@@ -677,11 +739,9 @@ def main():
     os.makedirs(args.output, exist_ok=True)
     state = load_state(args.output)
 
-    # Resume or fresh start
     if not state["queue"]:
         state["queue"] = [d for d in domains if d not in state["completed"]]
     else:
-        # Add any new domains not already in queue or completed
         existing = set(state["queue"]) | set(state["completed"])
         for d in domains:
             if d not in existing:
@@ -689,9 +749,8 @@ def main():
 
     save_state(state, args.output)
 
-    total_in_queue = len(state["queue"])
-    print(f"[*] fuzzai | AI: {args.ai} | Threads: {args.threads} | Depth: {args.depth}")
-    print(f"[*] Queue: {total_in_queue} domains | Completed: {len(state['completed'])}")
+    print(f"[*] fuzzai | AI: {args.ai} | Threads: {args.threads} | Depth: {args.depth} | AI budget: {args.ai_budget}/domain")
+    print(f"[*] Queue: {len(state['queue'])} domains | Completed: {len(state['completed'])}")
     print(f"[*] Output: {args.output}")
 
     # Reload findings from already-completed domains (resume safety)
@@ -721,13 +780,20 @@ def main():
         print(f"[*] TARGET: {domain_url}")
         print(f"{'='*60}")
 
+        # Reset AI budget for this domain
+        _ai_budget["calls"]  = 0
+        _ai_budget["max"]    = args.ai_budget
+        _ai_budget["domain"] = domain_url
+
+        logger = DomainLogger(domain_dir)
+
         try:
             findings = fuzz_url(
                 domain_url, args.ai, domain_dir, state,
-                threads=args.threads
+                threads=args.threads, logger=logger
             )
             all_findings.extend(findings)
-            print(f"\n[+] Done: {domain_url} | Findings: {len(findings)}")
+            print(f"\n[+] Done: {domain_url} | Findings: {len(findings)} | AI calls used: {_ai_budget['calls']}/{args.ai_budget}")
 
             state["completed"].append(domain_url)
             state["current"] = None
@@ -743,6 +809,8 @@ def main():
             state["queue"].append(domain_url)
             state["current"] = None
             save_state(state, args.output)
+        finally:
+            logger.close()
 
     # Summary
     critical = [f for f in all_findings if f.get("severity") == "critical"]
