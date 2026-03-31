@@ -131,10 +131,17 @@ def fetch_headers(url):
         return {}, ""
 
 
-def is_blocked(lines, errors):
+def is_blocked(lines, errors, stderr=""):
     """Detect WAF/rate-limit blocking from ffuf output."""
     if errors > 10:
         return True
+    # Check stderr for block indicators
+    if stderr:
+        block_patterns = ["cloudflare", "captcha", "access denied", "waf", "blocked",
+                          "rate limit", "too many requests", "forbidden by policy"]
+        sl = stderr.lower()
+        if any(p in sl for p in block_patterns):
+            return True
     if not lines:
         return False
     # All responses same size 0 or all 429/503
@@ -160,8 +167,7 @@ def load_state(results_dir):
         "completed": [],
         "queue": [],
         "current": None,
-        "visited_urls": [],          # dedupe across all runs
-        "domain_progress": {}        # per-domain partial progress
+        "visited_urls": []
     }
 
 
@@ -291,8 +297,24 @@ def analyze_and_filter(url, results, ai):
     prompt = load_prompt("filter_analysis.prompt", url=url, results=results_text)
     out = ask_ai(prompt, ai=ai)
     data = extract_json(out)
+    try:
+        validate_ai_json(data, ["filter_command"])
+    except ValueError:
+        data["filter_command"] = ""
     filter_cmd = data.get("filter_command", "")
-    flags = [f for f in filter_cmd.split() if f] if filter_cmd else []
+    # Only allow safe ffuf filter flags — no shell injection
+    allowed_flags = {"-fs", "-fw", "-fl", "-fc", "-fr", "-mc"}
+    raw_flags = filter_cmd.split() if filter_cmd else []
+    flags = []
+    i = 0
+    while i < len(raw_flags):
+        if raw_flags[i] in allowed_flags and i + 1 < len(raw_flags):
+            val = raw_flags[i + 1]
+            if re.match(r'^[\d,]+$', val):   # only digits and commas
+                flags += [raw_flags[i], val]
+            i += 2
+        else:
+            i += 1
     return flags, data
 
 
@@ -387,13 +409,13 @@ def fuzz_url(target_url, ai, domain_dir, state, depth=0, tech=None, filter_flags
     )
 
     # WAF check
-    if is_blocked(sample_lines, errors):
+    if is_blocked(sample_lines, errors, stderr):
         print(f"{indent}[!] Possible block detected. Retrying slow (-t 5 -p 1-3) ...")
         sample_lines, errors, total, stderr = run_ffuf_sampled(
             fuzz_target, wordlist, SAMPLE_RATIO,
             extra_flags=["-p", "1-3"], threads=5
         )
-        if is_blocked(sample_lines, errors):
+        if is_blocked(sample_lines, errors, stderr):
             print(f"{indent}[!] Still blocked — skipping {target_url}")
             return []
 
@@ -528,15 +550,27 @@ def fuzz_url(target_url, ai, domain_dir, state, depth=0, tech=None, filter_flags
                         threads=threads
                     )
 
-                    for pline in (p1_lines + p2_lines):
+                    # Tag each line with the test value that found it
+                    tagged = ([(l, "testvalue") for l in p1_lines] +
+                              [(l, "../../etc/passwd") for l in p2_lines])
+
+                    # Parse baseline sizes from filter flags — handle comma-separated values
+                    baseline_sizes = set()
+                    for m in re.finditer(r'-fs\s+([\d,]+)', " ".join(filter_flags)):
+                        for val in m.group(1).split(','):
+                            try:
+                                baseline_sizes.add(int(val.strip()))
+                            except ValueError:
+                                pass
+
+                    for pline, test_val in tagged:
                         pd = parse_ffuf_line(pline)
                         if not pd:
                             continue
                         param_name = pd["path"]
-                        param_path = f"{path}?{param_name}=value"
+                        param_path = f"{path}?{param_name}={test_val}"
 
                         # Only save if response is meaningfully different (not same size as baseline)
-                        baseline_sizes = [int(x) for x in re.findall(r'-fs\s+(\d+)', " ".join(filter_flags))]
                         if baseline_sizes and pd["size"] in baseline_sizes:
                             continue
 
@@ -544,7 +578,7 @@ def fuzz_url(target_url, ai, domain_dir, state, depth=0, tech=None, filter_flags
                         try:
                             psnippet = ""
                             try:
-                                pr = requests.get(f"{full_url}?{param_name}=test",
+                                pr = requests.get(f"{full_url}?{param_name}={test_val}",
                                                   timeout=8, headers={"User-Agent": "Mozilla/5.0"})
                                 psnippet = pr.text[:300]
                             except Exception:
@@ -643,7 +677,19 @@ def main():
     print(f"[*] Queue: {total_in_queue} domains | Completed: {len(state['completed'])}")
     print(f"[*] Output: {args.output}")
 
+    # Reload findings from already-completed domains (resume safety)
     all_findings = []
+    for completed_url in state.get("completed", []):
+        d_name = urlparse(completed_url).netloc.replace(".", "_").replace(":", "_")
+        d_findings = os.path.join(args.output, d_name, "findings.json")
+        if os.path.exists(d_findings):
+            try:
+                with open(d_findings) as f:
+                    all_findings.extend(json.load(f))
+            except Exception:
+                pass
+    if all_findings:
+        print(f"[*] Resuming — reloaded {len(all_findings)} findings from previous runs")
 
     while state["queue"]:
         domain_url = state["queue"].pop(0)
